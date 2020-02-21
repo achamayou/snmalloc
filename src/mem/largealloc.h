@@ -55,7 +55,7 @@ namespace snmalloc
   // global state of the allocator.  This is currently stored in the memory
   // provider, so we add this in.
   template<class PAL>
-  class MemoryProviderStateMixin : public PAL
+  class MemoryProviderStateMixin : public PalNotificationObject, public PAL
   {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
     void* bump;
@@ -71,10 +71,6 @@ namespace snmalloc
       remaining = SUPERSLAB_SIZE;
     }
 
-    /**
-     * The last time we saw a low memory notification.
-     */
-    std::atomic<uint64_t> last_low_memory_epoch = 0;
     std::atomic_flag lazy_decommit_guard;
     SNMALLOC_SLOW_PATH void lazy_decommit()
     {
@@ -140,11 +136,30 @@ namespace snmalloc
       large_stack[large_class].push(reinterpret_cast<Largeslab*>(p));
     }
 
+    /***
+     * Method for callback object to perform lazy decommit.
+     **/
+    static void process(PalNotificationObject* p)
+    {
+      // Unsafe downcast here. Don't want vtable and RTTI.
+      auto self = reinterpret_cast<MemoryProviderStateMixin<PAL>*>(p);
+      self->lazy_decommit();
+    }
+
   public:
     /**
      * Stack of large allocations that have been returned for reuse.
      */
     ModArray<NUM_LARGE_CLASSES, MPMCStack<Largeslab, PreZeroed>> large_stack;
+
+    MemoryProviderStateMixin()
+    {
+      if constexpr (pal_supports<LowMemoryNotification, PAL>)
+      {
+        PalNotificationObject::pal_notify = &process;
+        PAL::register_for_low_memory_callback(this);
+      }
+    }
 
     /**
      * Primitive allocator for structure that are required before
@@ -195,24 +210,6 @@ namespace snmalloc
         page_start, static_cast<size_t>(page_end - page_start));
 
       return new (p) T(std::forward<Args...>(args)...);
-    }
-
-    /**
-     * Returns the number of low memory notifications that have been received
-     * (over the lifetime of this process).  If the underlying system does not
-     * support low memory notifications, this will return 0.
-     */
-    SNMALLOC_FAST_PATH
-    uint64_t low_memory_epoch()
-    {
-      if constexpr (pal_supports<LowMemoryNotification, PAL>)
-      {
-        return PAL::low_memory_epoch();
-      }
-      else
-      {
-        return 0;
-      }
     }
 
     template<bool committed>
@@ -280,41 +277,6 @@ namespace snmalloc
         return result;
       }
     }
-
-    SNMALLOC_FAST_PATH void lazy_decommit_if_needed()
-    {
-#ifdef TEST_LAZY_DECOMMIT
-      static_assert(
-        TEST_LAZY_DECOMMIT > 0,
-        "TEST_LAZY_DECOMMIT must be a positive integer value.");
-      static std::atomic<uint64_t> counter;
-      auto c = counter++;
-      if (c % TEST_LAZY_DECOMMIT == 0)
-      {
-        lazy_decommit();
-      }
-#else
-      if constexpr (decommit_strategy == DecommitSuperLazy)
-      {
-        auto new_epoch = low_memory_epoch();
-        auto old_epoch = last_low_memory_epoch.load(std::memory_order_acquire);
-        if (new_epoch > old_epoch)
-        {
-          // Try to update the epoch to the value that we've seen.  If
-          // another thread has seen a newer epoch than us (or done the same
-          // update) let them win.
-          do
-          {
-            if (last_low_memory_epoch.compare_exchange_strong(
-                  old_epoch, new_epoch))
-            {
-              lazy_decommit();
-            }
-          } while (old_epoch < new_epoch);
-        }
-      }
-#endif
-    }
   };
 
   using Stats = AllocStats<NUM_SIZECLASSES, NUM_LARGE_CLASSES>;
@@ -345,7 +307,6 @@ namespace snmalloc
         size = rsize;
 
       void* p = memory_provider.large_stack[large_class].pop();
-      memory_provider.lazy_decommit_if_needed();
 
       if (p == nullptr)
       {
@@ -356,8 +317,7 @@ namespace snmalloc
       {
         stats.superslab_pop();
 
-        // Cross-reference alloc.h's large_dealloc decommitment condition
-        // and lazy_decommit_if_needed.
+        // Cross-reference alloc.h's large_dealloc decommitment condition.
         bool decommitted =
           ((decommit_strategy == DecommitSuperLazy) &&
            (static_cast<Baseslab*>(p)->get_kind() == Decommitted)) ||
@@ -413,7 +373,6 @@ namespace snmalloc
 
       stats.superslab_push();
       memory_provider.large_stack[large_class].push(static_cast<Largeslab*>(p));
-      memory_provider.lazy_decommit_if_needed();
     }
   };
 
